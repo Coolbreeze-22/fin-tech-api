@@ -2,7 +2,14 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import userModel from "../models/userModel.js";
 import tokenModel from "../models/tokenModel.js";
-import { mailer } from "./mailer.js";
+import { mailer } from "../services/mailer.js";
+import { getUserDeviceInfo } from "../services/userAgent.js";
+import {
+  handleUserUnblock,
+  generateUniqueAccountNumber,
+  isUserMissingOrBlockedOrUnverified,
+  isUserMissingOrBlockedOrVerified,
+} from "./utils.js";
 
 export const getUsers = async (req, res) => {
   try {
@@ -14,53 +21,50 @@ export const getUsers = async (req, res) => {
     const allUsers = await userModel.find();
     res.status(200).json(allUsers);
   } catch (error) {
-    res.status(404).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
 
 export const signIn = async (req, res) => {
   const { email, password } = req.body;
   try {
-    const existingUser = await userModel.findOne({ email });
-    // const existingToken = await userModel.findOne({ email });
-    if (!existingUser)
-      return res.status(400).json({ message: "User doesn't exist. Sign Up" });
-    if (existingUser.blockedUntil > Date.now()) {
-      return res.status(400).json({
-        message: "Account temporarily suspended, try again later",
-      });
-    }
-    if (!existingUser.emailVerified) {
-      return res.status(400).json({
-        message: "Email not verified. Verify now",
-      });
-    }
+    let existingUser;
+    existingUser = await userModel.findOne({ email });
+    if (isUserMissingOrBlockedOrUnverified(existingUser, res)) return;
+    existingUser = await handleUserUnblock(existingUser);
 
     const isPasswordCorrect = await bcrypt.compare(
       password,
       existingUser.password
     );
     if (!isPasswordCorrect)
-      return res.status(404).json({ message: "Incorrect Password." });
+      return res.status(401).json({ message: "Incorrect Password." });
 
-    await userModel.findByIdAndUpdate(
+    const deviceInfo = getUserDeviceInfo(req);
+    console.log("deviceInfo: ", deviceInfo);
+
+    const newUser = await userModel.findByIdAndUpdate(
       existingUser._id,
       {
-        $set: { lastLoginAt: Date.now().toString() },
-        $push: { signedin: 1 },
+        $set: { lastLoginAt: new Date().toISOString() },
+        $push: { signedIn: deviceInfo },
       },
       { new: true }
     );
 
     const token = jwt.sign(
-      { email: existingUser.email, id: existingUser._id },
+      { email: newUser.email, id: newUser._id },
       process.env.TESTID,
       { expiresIn: "3d" }
     );
 
-    return res.status(200).json({ user: existingUser, token });
+    return res
+      .status(200)
+      .json({ user: newUser, token, toBeRemoved: deviceInfo });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
 
@@ -75,70 +79,81 @@ export const signUp = async (req, res) => {
     const newUser = await userModel.create({
       email,
       password: hashedPassword,
+      status: "pending",
     });
 
     return res
       .status(200)
       .json({ message: "Account created successfully", email: newUser.email });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
 
 export const sendVerificationToken = async (req, res) => {
   const { email } = req.body;
   try {
-    const existingUser = await userModel.findOne({ email });
-    if (!existingUser)
-      return res
-        .status(400)
-        .json({ message: "No user found with the provided email address" });
-    if (existingUser.emailVerified)
-      return res
-        .status(400)
-        .json({ message: "Email is already verified. Sign in" });
+    let existingUser;
+    existingUser = await userModel.findOne({ email });
 
-    const data = await mailer(existingUser.email, "verifyEmail");
+    if (isUserMissingOrBlockedOrVerified(existingUser, res)) return;
+    existingUser = await handleUserUnblock(existingUser);
+    const result = await mailer(existingUser.email, "verifyEmail");
 
-    return res.status(200).json({ message: "Code sent successfully" });
+    if (typeof result === "string") {
+      return res.status(400).json({ message: result });
+    }
+
+    return res.status(200).json({
+      message: "Verification code sent successfully",
+      email: existingUser.email,
+      accepted: result.accepted,
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
 
 export const verifyEmail = async (req, res) => {
   const { email, token } = req.body;
   try {
+    let existingUser;
+    existingUser = await userModel.findOne({ email });
     const existingToken = await tokenModel.findOne({ email });
-    const existingUser = await userModel.findOne({ email });
-    if (existingUser.blockedUntil > Date.now()) {
-      return res.status(400).json({
-        message: "Account temporarily suspended, try again later",
-      });
-    }
+
+    if (isUserMissingOrBlockedOrVerified(existingUser, res)) return;
+    existingUser = await handleUserUnblock(existingUser);
 
     if (!existingToken) {
       return res.status(404).json({
-        message:
-          "No token found for this email. Try requesting for a new token",
-      });
-    }
-
-    if (existingToken.attempts >= 5) {
-      await tokenModel.findOneAndDelete({ email });
-      const blockedUntil = Date.now() + 3 * 60 * 60 * 1000;
-      await userModel.findOneAndUpdate({ email }, { $set: { blockedUntil } });
-      return res.status(400).json({
-        message: "Maximum attempts exceeded. Account temporarily suspended.",
+        message: "Token not found. Try requesting for a new token.",
       });
     }
 
     if (existingToken.code !== token) {
+      if (existingToken.attempts + 1 >= 5) {
+        await tokenModel.findOneAndDelete({ email });
+
+        const blockedUntil = Date.now() + 3 * 60 * 60 * 1000;
+        const status = "blocked";
+        await userModel.findOneAndUpdate(
+          { email },
+          { $set: { blockedUntil, status } }
+        );
+
+        return res.status(400).json({
+          message: "Maximum attempts exceeded. Account temporarily suspended.",
+        });
+      }
+
       const updatedToken = await tokenModel.findOneAndUpdate(
         { email },
         { $set: { attempts: existingToken.attempts + 1 } },
         { new: true }
       );
+
       return res.status(400).json({
         message: "Incorrect token",
         attempts: updatedToken.attempts,
@@ -147,17 +162,24 @@ export const verifyEmail = async (req, res) => {
 
     if (existingToken.expiresAt < Date.now()) {
       await tokenModel.findOneAndDelete({ email });
-      return res.status(400).json({ message: "Token has expired" });
+      return res.status(400).json({
+        message: "Expired token. Try requesting for a new token.",
+      });
     }
 
+    await tokenModel.findOneAndDelete({ email });
     await userModel.findOneAndUpdate(
       { email },
-      { $set: { emailVerified: true } }
+      { $set: { emailVerified: true, status: "active" } }
     );
-    await tokenModel.findOneAndDelete({ email });
-    return res.status(200).json({ message: "Email verified successfully" });
+
+    return res.status(200).json({
+      message: "Email verified successfully",
+      email: existingUser.email,
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
 
@@ -168,37 +190,39 @@ export const completeSignUp = async (req, res) => {
     firstName,
     lastName,
     dateOfBirth,
-    address,
+    country,
     state,
+    city,
+    address,
   } = req.body;
+
   try {
-    const existingUser = await userModel.findOne({ email });
-    const existingAccountNum = await userModel.findOne({
-      accountNumber: phoneNumber,
-    });
-    if (!existingUser)
-      return res.status(400).json({
-        message: "User does not exist. Check provided email address again.",
-      });
-    if (existingAccountNum)
-      return res.status(400).json({ message: "Account number already in use" });
+    let existingUser;
+    existingUser = await userModel.findOne({ email });
+
+    if (isUserMissingOrBlockedOrUnverified(existingUser, res)) return;
+    existingUser = await handleUserUnblock(existingUser);
+    const deviceInfo = getUserDeviceInfo(req);
+    const accountNumber = await generateUniqueAccountNumber();
 
     const updatedUser = await userModel.findOneAndUpdate(
       { email },
       {
         $set: {
-          email,
           phoneNumber,
           firstName,
           lastName,
           dateOfBirth,
-          address,
+          country,
           state,
-          accountNumber: phoneNumber,
-          lastLoginAt: Date.now().toString(),
-          signedIn: [1],
+          city,
+          address,
+          accountNumber,
+          lastLoginAt: new Date().toISOString(),
         },
-      }
+        $push: { signedIn: deviceInfo },
+      },
+      { new: true }
     );
 
     const token = jwt.sign(
@@ -211,24 +235,99 @@ export const completeSignUp = async (req, res) => {
 
     return res.status(200).json({ user: updatedUser, token });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
 
 export const signOut = async (req, res) => {
   try {
-    await userModel.findByIdAndUpdate(req.userId, {
-      $set: {
-        lastLogoutAt: Date.now().toString(),
+    const { userId } = req;
+    const user = await userModel.findById(userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    const deviceInfo = getUserDeviceInfo(req);
+
+    const updatedSessions = user.signedIn.filter(
+      (session) =>
+        session.ip !== deviceInfo.ip || session.device !== deviceInfo.device
+    );
+
+    if (user.signedIn.length === updatedSessions.length) {
+      return res.status(400).json({ message: "No matching sessions found" });
+    }
+
+    await userModel.findByIdAndUpdate(
+      userId,
+      {
+        signedIn: updatedSessions,
+        lastLogoutAt: new Date().toISOString(),
       },
-      $pop: {
-        signedin: 1, // remove last element from array
-      },
+      { new: true }
+    );
+
+    return res.status(200).json({
+      message: "Signed out successfully",
+      sessionsClosed: user.signedIn.length - updatedSessions.length,
     });
   } catch (error) {
-    res.status(404).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
+    // return res.status(500).json({ message: "Internal server error" });
   }
 };
+
+// continue from here
+export const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+    const user = await userModel.findOne({ email });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ message: "User not found" });
+    }
+
+    const data = mailer(user.email, "");
+
+    return res.status(200).json({ message: "Code sent to email successfully" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const resetPassword = async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    const user = await userModel.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    if (!user.passwordResetCode || user.passwordResetCode.code !== code) {
+      user.passwordResetCode.attempts += 1;
+      await user.save();
+      return res.status(401).json({ message: "Invalid code" });
+    }
+
+    if (user.passwordResetCode.expiresAt < new Date()) {
+      return res.status(401).json({ message: "Code has expired" });
+    }
+
+    if (user.passwordResetCode.attempts >= 3) {
+      return res.status(401).json({ message: "Maximum attempts exceeded" });
+    }
+
+    // Update the user's password
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+    user.password = hashedPassword;
+    user.passwordResetCode = undefined;
+    await user.save();
+
+    return res.status(200).json({ message: "Password reset successfully" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
 
 export const updateAccount = async (req, res) => {
   const data = req.body;
@@ -273,54 +372,3 @@ export const deleteAccount = async (req, res) => {
   }
 };
 
-export const forgotPassword = async (req, res) => {
-  try {
-    const { email } = req.body;
-    const user = await userModel.findOne({ email });
-    if (!user) {
-      return res
-        .status(404)
-        .json({ message: "User not found with the provided email address" });
-    }
-
-    const data = mailer(user.email, "");
-
-    return res.status(200).json({ message: "Code sent to email successfully" });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-export const resetPassword = async (req, res) => {
-  try {
-    const { email, code, newPassword } = req.body;
-    const user = await userModel.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    if (!user.passwordResetCode || user.passwordResetCode.code !== code) {
-      user.passwordResetCode.attempts += 1;
-      await user.save();
-      return res.status(401).json({ message: "Invalid code" });
-    }
-
-    if (user.passwordResetCode.expiresAt < new Date()) {
-      return res.status(401).json({ message: "Code has expired" });
-    }
-
-    if (user.passwordResetCode.attempts >= 3) {
-      return res.status(401).json({ message: "Maximum attempts exceeded" });
-    }
-
-    // Update the user's password
-    const hashedPassword = await bcrypt.hash(newPassword, 12);
-    user.password = hashedPassword;
-    user.passwordResetCode = undefined;
-    await user.save();
-
-    return res.status(200).json({ message: "Password reset successfully" });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};

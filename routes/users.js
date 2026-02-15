@@ -22,7 +22,7 @@ userRouter.post("/send-verification-token", sendVerificationToken);
 userRouter.patch("/verify-email", verifyEmail);
 userRouter.patch("/complete-signup", completeSignUp);
 userRouter.patch("/signin", signIn);
-userRouter.patch("/signOut", authMiddle, signOut);
+userRouter.patch("/signout", authMiddle, signOut);
 userRouter.patch("/forgot-password", forgotPassword);
 userRouter.patch("/reset-password", resetPassword);
 userRouter.patch("/update-account/:id", authMiddle, updateAccount);
