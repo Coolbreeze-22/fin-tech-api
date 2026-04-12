@@ -40,7 +40,7 @@ export const cleanExpiredTokens = async () => {
 
 const agenda = new Agenda({
   db: {
-    address: process.env.CONNECTION_URL,
+    address: process.env.CONNECTION_URL_WITHOUT_SRV,
     collection: "fintechAgendaJobs",
     options: { useUnifiedTopology: true },
   },
