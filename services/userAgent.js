@@ -7,10 +7,10 @@ export const getUserDeviceInfo = (req) => {
   parser.setUA(userAgent);
   const ua = parser.getResult();
 
-  const platform = `${ua.browser.name || "Unknown"} on ${
+  const platform = `${ua.browser.name || "Unknown browser"} on ${
     ua.os.name || "Unknown OS"
   }`;
-  const device = ua.device.type || "desktop";
+  const device = ua.device.type || "unknown device";
   const ip =
     req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
     req.socket?.remoteAddress ||
