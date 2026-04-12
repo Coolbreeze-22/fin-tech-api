@@ -24,10 +24,11 @@ app.use((err, req, res, next) => {
   }
 });
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT
+const CONNECTION_URL = process.env.CONNECTION_URL_WITHOUT_SRV
 
 mongoose
-  .connect(process.env.CONNECTION_URL)
+  .connect(CONNECTION_URL)
   .then(async () => {
     // await startScheduler();
     // console.log("✅ Scheduler started");
